@@ -1,45 +1,100 @@
 package me.srrapero720.dimthread.util;
 
-import it.unimi.dsi.fastutil.objects.Object2BooleanArrayMap;
-import it.unimi.dsi.fastutil.objects.Object2ObjectArrayMap;
-import net.minecraft.server.MinecraftServer;
-import net.minecraft.world.level.GameRules;
+import me.srrapero720.dimthread.DimThread;
 import me.srrapero720.dimthread.init.ModGameRules;
+import me.srrapero720.dimthread.thread.DimThreadRegistry;
 import me.srrapero720.dimthread.thread.ThreadPool;
+import net.minecraft.server.MinecraftServer;
 
-import java.util.Collections;
-import java.util.ConcurrentModificationException;
+import java.util.HashMap;
 import java.util.Map;
 
 public class ServerManager {
-	private final Map<MinecraftServer, Boolean> actives = Collections.synchronizedMap(new Object2BooleanArrayMap<>());
-	public final Map<MinecraftServer, ThreadPool> threadPools = Collections.synchronizedMap(new Object2ObjectArrayMap<>());
+    public final Map<MinecraftServer, ThreadPool> threadPools = new HashMap<>();
+    private final Map<MinecraftServer, Boolean> active = new HashMap<>();
+    
+    // Time in ms to consider a thread pool potentially deadlocked
+    private static final long DEADLOCK_TIMEOUT = 30000; // 30 seconds
 
-	public boolean isActive(MinecraftServer server) {
-		return this.actives.computeIfAbsent(server, s -> s.getGameRules().getBoolean(ModGameRules.ACTIVE.getKey()));
-	}
+    public ThreadPool getThreadPool(MinecraftServer server) {
+        return threadPools.computeIfAbsent(server, s ->
+                new ThreadPool(s.getGameRules().getInt(ModGameRules.THREAD_COUNT.getKey())));
+    }
 
-	public void setActive(MinecraftServer server, GameRules.BooleanValue value) {
-		this.actives.put(server, value.get());
-	}
+    public void setActive(MinecraftServer server, boolean value) {
+        if (server == null) return;
 
-	public ThreadPool getThreadPool(MinecraftServer server) {
-		return this.threadPools.computeIfAbsent(server, s -> new ThreadPool(s.getGameRules().getInt(ModGameRules.THREAD_COUNT.getKey())));
-	}
+        if (value && !this.isActive(server)) {
+            if (this.threadPools.containsKey(server)) {
+                this.threadPools.get(server).restart();
+            }
+        } else if (!value && this.isActive(server)) {
+            if (this.threadPools.containsKey(server)) {
+                this.threadPools.get(server).shutdown();
+            }
+        }
 
-	public void setThreadCount(MinecraftServer server, GameRules.IntegerValue value) {
-		ThreadPool current = getThreadPool(server);
+        this.active.put(server, value);
+    }
 
-		if (current.getActiveCount() != 0) {
-			throw new ConcurrentModificationException("Setting the thread count in wrong phase");
-		}
+    public boolean isActive(MinecraftServer server) {
+        return server != null && this.active.getOrDefault(server, false);
+    }
 
-		this.threadPools.put(server, new ThreadPool(value.get()));
-		current.shutdown();
-	}
+    public void setThreadCount(MinecraftServer server, int value) {
+        if (server == null) return;
 
-	public void clear() {
-		actives.clear();
-		threadPools.clear();
-	}
+        boolean oldActive = this.isActive(server);
+
+        if (oldActive) {
+            this.setActive(server, false);
+        }
+
+        this.threadPools.put(server, new ThreadPool(value));
+
+        if (oldActive) {
+            this.setActive(server, true);
+        }
+    }
+    
+    /**
+     * Detects and handles potential deadlocks in dimension loading
+     * @param server The Minecraft server instance
+     * @return true if a deadlock was detected and handled
+     */
+    public boolean detectAndHandleDeadlocks(MinecraftServer server) {
+        if (!isActive(server)) return false;
+        
+        ThreadPool pool = getThreadPool(server);
+        
+        // First check the registry for deadlocks
+        boolean deadlocksDetected = DimThreadRegistry.detectAndClearDeadlocks();
+        
+        // Then check if threads have been active for too long
+        if (pool.getActiveCount() > 0) {
+            long currentTime = System.currentTimeMillis();
+            
+            // If we detect a potential deadlock, restart the thread pool
+            if (pool.getLastActivityTime() + DEADLOCK_TIMEOUT < currentTime) {
+                DimThread.LOGGER.warn("Potential deadlock detected in dimension loading. Thread pool has been inactive for {} ms. Restarting thread pool.", 
+                    currentTime - pool.getLastActivityTime());
+                    
+                try {
+                    // Give threads a chance to respond to interrupts
+                    Thread.sleep(1000);
+                } catch (InterruptedException ignored) {}
+                
+                pool.shutdown();
+                threadPools.put(server, new ThreadPool(server.getGameRules().getInt(ModGameRules.THREAD_COUNT.getKey())));
+                return true;
+            }
+        }
+        
+        return deadlocksDetected;
+    }
+
+    public void clear() {
+        this.threadPools.clear();
+        this.active.clear();
+    }
 }

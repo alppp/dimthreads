@@ -1,5 +1,7 @@
 package me.srrapero720.dimthread.thread;
 
+import me.srrapero720.dimthread.DimThread;
+
 import java.util.Iterator;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executors;
@@ -16,6 +18,7 @@ public class ThreadPool {
 	private ThreadPoolExecutor executor;
 	private final int threadCount;
 	private final IntLatch activeCount = new IntLatch();
+	private volatile long lastActivityTime;
 
 	public ThreadPool() {
 		this(Runtime.getRuntime().availableProcessors());
@@ -23,6 +26,7 @@ public class ThreadPool {
 
 	public ThreadPool(int threadCount) {
 		this.threadCount = threadCount;
+		this.lastActivityTime = System.currentTimeMillis();
 		this.restart();
 	}
 
@@ -40,10 +44,23 @@ public class ThreadPool {
 
 	public void execute(Runnable action) {
 		this.activeCount.increment();
+		this.lastActivityTime = System.currentTimeMillis();
 
 		this.executor.execute(() -> {
+			Thread currentThread = Thread.currentThread();
 			try {
+				// Register activity at the start
+				DimThreadRegistry.updateActivity(currentThread);
+				
+				// Run the actual task
 				action.run();
+				
+				// Update last activity time when task completes
+				this.lastActivityTime = System.currentTimeMillis();
+				DimThreadRegistry.updateActivity(currentThread);
+			} catch (Throwable t) {
+				// Log any unhandled exceptions
+				DimThread.LOGGER.error("Uncaught exception in DimThread worker", t);
 			} finally {
 				this.activeCount.decrement();
 			}
@@ -115,30 +132,80 @@ public class ThreadPool {
 	}
 
 	public void awaitCompletion() {
-		this.waitFor(value -> value == 0);
-	}
-
-	public void waitFor(IntPredicate condition) {
+		// First try waiting normally
 		try {
-			this.activeCount.waitUntil(condition);
-		} catch(InterruptedException e) {
+			if (this.waitFor(value -> value == 0, 30000)) {
+				return; // Successfully completed
+			}
+		} catch (InterruptedException e) {
 			e.printStackTrace();
 		}
+		
+		// If we're still here, we've timed out
+		DimThread.LOGGER.warn("Thread pool tasks did not complete within timeout, checking for deadlocks");
+		
+		// Check for and attempt to clear deadlocks
+		if (DimThreadRegistry.detectAndClearDeadlocks()) {
+			DimThread.LOGGER.warn("Deadlocks detected and threads interrupted, continuing execution");
+		} else {
+			DimThread.LOGGER.error("No deadlocks detected but tasks are not completing. This may indicate a performance issue.");
+		}
+	}
+
+	/**
+	 * Wait until the predicate returns true for the active count, with a timeout
+	 * @param condition The condition to check
+	 * @param timeoutMillis Maximum time to wait in milliseconds
+	 * @return true if condition was met, false if timed out
+	 */
+	public boolean waitFor(IntPredicate condition, long timeoutMillis) throws InterruptedException {
+		long deadline = System.currentTimeMillis() + timeoutMillis;
+		while (!condition.test(this.activeCount.getCount())) {
+			long remaining = deadline - System.currentTimeMillis();
+			if (remaining <= 0) {
+				return false; // Timeout
+			}
+			synchronized (this.activeCount) {
+				this.activeCount.wait(Math.min(remaining, 1000)); // Wait up to 1 second at a time
+			}
+		}
+		return true;
+	}
+
+	// Replace the existing waitFor method with this one
+	public void waitFor(IntPredicate condition) {
+		try {
+			this.waitFor(condition, 30000); // Default 30 second timeout
+		} catch (InterruptedException e) {
+			e.printStackTrace();
+		}
+	}
+
+	/**
+	 * Get the timestamp of the last activity in this thread pool
+	 * @return timestamp in milliseconds
+	 */
+	public long getLastActivityTime() {
+		return this.lastActivityTime;
 	}
 
 	public void restart() {
 		if(this.executor == null || this.executor.isShutdown()) {
 			this.executor = (ThreadPoolExecutor) Executors.newFixedThreadPool(this.threadCount, r -> {
-				Thread t  = new Thread(r);
+				Thread t = new Thread(r);
 				t.setDaemon(true);
 				t.setName(MOD_ID + "_server_" + "unassigned");
+				// Register the thread when it's created
+				DimThreadRegistry.register(t);
 				return t;
 			});
 		}
 	}
 
 	public void shutdown() {
-		this.executor.shutdown();
+		if (this.executor != null && !this.executor.isShutdown()) {
+			this.executor.shutdown();
+		}
 	}
 
 	public boolean isShutdown() {
@@ -146,33 +213,32 @@ public class ThreadPool {
 	}
 
 	private static class IntLatch {
-		private CountDownLatch latch;
-
+		private int count;
+		
 		private IntLatch() {
 			this(0);
 		}
-
+		
 		private IntLatch(int count) {
-			this.latch = new CountDownLatch(count);
+			this.count = count;
 		}
-
+		
 		private synchronized int getCount() {
-			return (int)this.latch.getCount();
+			return this.count;
 		}
-
+		
 		private synchronized void decrement() {
-			this.latch.countDown();
+			this.count--;
 			this.notifyAll();
 		}
-
+		
 		private synchronized void increment() {
-			this.latch = new CountDownLatch((int)this.latch.getCount() + 1);
-			this.notifyAll();
+			this.count++;
 		}
-
+		
 		private synchronized void waitUntil(IntPredicate predicate) throws InterruptedException {
-			while(!predicate.test(this.getCount())) {
-				this.wait();
+			while (!predicate.test(this.getCount())) {
+				this.wait(1000); // Wait in 1-second increments for better responsiveness
 			}
 		}
 	}
